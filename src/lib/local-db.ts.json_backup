@@ -1,0 +1,333 @@
+// 数据库存储层 - 基于云端对象存储
+import { S3Storage } from 'coze-coding-dev-sdk';
+import { promises as fs } from 'fs';
+import path from 'path';
+import { hashPassword as authHashPassword } from './crypto';
+
+// 类型定义
+interface User {
+  id: string;
+  username: string;
+  password_hash: string;
+  role: string;
+  name: string;
+  employee_id: string;
+  inspection_center: string;
+  inspection_department: string;
+  inspection_team: string;
+  inspection_position: string;
+  created_at: string;
+  updated_at: string;
+}
+
+interface Hazard {
+  id: string;
+  [key: string]: any;
+}
+
+interface RiskItem {
+  id: string;
+  [key: string]: any;
+}
+
+// 配置常量
+const BACKUP_BUCKET = process.env.COZE_BUCKET_NAME || '';
+const DATA_PREFIX = 'hazard-data/';
+// 使用项目内 data/ 目录持久化，不再使用 /tmp（重启丢失）
+const LOCAL_DATA_DIR = path.join(process.cwd(), 'data');
+
+// 本地存储键名
+const USERS_KEY = 'users.json';
+const HAZARDS_KEY = 'hazards.json';
+const RISK_ITEMS_KEY = 'risk-items.json';
+
+// 客户端单例
+let cloudStorage: S3Storage | null = null;
+
+// 初始化存储
+function initStorage(): S3Storage | null {
+  if (!BACKUP_BUCKET) {
+    console.log('[CloudDB] 未配置云端存储');
+    return null;
+  }
+  
+  if (!cloudStorage) {
+    cloudStorage = new S3Storage({
+      endpointUrl: process.env.COZE_BUCKET_ENDPOINT_URL,
+      bucketName: BACKUP_BUCKET,
+      region: 'cn-beijing',
+    });
+  }
+  
+  return cloudStorage;
+}
+
+// 辅助函数
+function getLocalPath(fileName: string): string {
+  return path.join(LOCAL_DATA_DIR, fileName);
+}
+
+function getCloudPrefix(fileName: string): string {
+  const base = fileName.replace('.json', '');
+  return `${DATA_PREFIX}${base}_`;
+}
+
+async function ensureLocal(): Promise<void> {
+  try {
+    await fs.mkdir(LOCAL_DATA_DIR, { recursive: true });
+  } catch {}
+}
+
+// 本地读写
+async function readLocal<T>(fileName: string): Promise<T[]> {
+  try {
+    const content = await fs.readFile(getLocalPath(fileName), 'utf-8');
+    const data = JSON.parse(content);
+    if (Array.isArray(data)) return data as T[];
+  } catch {}
+  return [];
+}
+
+async function writeLocal<T>(fileName: string, data: T): Promise<void> {
+  await ensureLocal();
+  await fs.writeFile(getLocalPath(fileName), JSON.stringify(data, null, 2));
+}
+
+// 云端读写
+async function readFromCloud<T>(fileName: string, defaults: T): Promise<T> {
+  const storage = initStorage();
+  if (!storage) return defaults;
+  
+  const prefix = getCloudPrefix(fileName);
+  
+  try {
+    const list = await storage.listFiles({ prefix });
+    
+    if (list.keys.length === 0) {
+      console.log(`[CloudDB] 云端无数据: ${fileName}`);
+      await writeToCloud(fileName, defaults);
+      return defaults;
+    }
+    
+    // 解析时间戳排序
+    const files = list.keys
+      .map(key => {
+        const match = key.match(/_(\d+)_/);
+        return { key, ts: match ? parseInt(match[1]) : 0 };
+      })
+      .sort((a, b) => b.ts - a.ts);
+    
+    const latestKey = files[0].key;
+    const buffer = await storage.readFile({ fileKey: latestKey });
+    const data = JSON.parse(buffer.toString());
+    
+    console.log(`[CloudDB] 云端读取: ${fileName} (${data.length}条)`);
+    await writeLocal(fileName, data);
+    
+    return data as T;
+  } catch (error: any) {
+    console.error(`[CloudDB] 云端读取失败: ${fileName}`, error.message);
+    return defaults;
+  }
+}
+
+async function writeToCloud<T>(fileName: string, data: T): Promise<boolean> {
+  await writeLocal(fileName, data);
+  
+  const storage = initStorage();
+  if (!storage) return true;
+  
+  const timestamp = Date.now();
+  const base = fileName.replace('.json', '');
+  const key = `${DATA_PREFIX}${base}_${timestamp}.json`;
+  
+  try {
+    await storage.uploadFile({
+      fileContent: Buffer.from(JSON.stringify(data, null, 2)),
+      fileName: key,
+      contentType: 'application/json',
+    });
+    console.log(`[CloudDB] 云端写入: ${fileName}`);
+    return true;
+  } catch (error: any) {
+    console.error(`[CloudDB] 云端写入失败: ${fileName}`, error.message);
+    return false;
+  }
+}
+
+// 默认数据
+const DEFAULT_USERS = [
+  { id: '1', username: 'admin', password_hash: authHashPassword('admin123'), role: 'admin', name: '系统管理员', employee_id: 'A001', inspection_center: '物资后勤中心', inspection_department: '综合管理部', inspection_team: '', inspection_position: '', created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
+  { id: '2', username: 'inspector1', password_hash: authHashPassword('admin123'), role: 'inspector', name: '张三', employee_id: 'E001', inspection_center: '物资后勤中心', inspection_department: '物资仓储部', inspection_team: '仓储班', inspection_position: '仓管员', created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
+  { id: '3', username: 'reviewer1', password_hash: authHashPassword('admin123'), role: 'reviewer', name: '李四', employee_id: 'M001', inspection_center: '物资后勤中心', inspection_department: '安全工作部', inspection_team: '安全组', inspection_position: '安全工作岗', created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
+];
+
+const DEFAULT_RISK_ITEMS = [
+  { id: '1', serial_number: 'A001', business_module: '仓储管理', specific_location: '物资总库', risk_point_description: '易燃易爆物品存储不符合防爆要求', risk_point_location: '物资总库', risk_level: 'large', risk_control_measures: '更换防爆灯具，使用防爆电器', hazard_inspection_method: '现场检查', hazard_inspection_cycle: '月度', hazard_inspection_position: '仓管员', control_responsibility_unit: '物资仓储部', control_responsibility_position: '仓储班长', remarks: '', created_at: new Date().toISOString(), updated_at: new Date().toISOString(), version: 1 },
+  { id: '2', serial_number: 'B001', business_module: '设备运行', specific_location: '仓库配电间', risk_point_description: '电气设备接地不良', risk_point_location: '配电间', risk_level: 'general', risk_control_measures: '定期检测接地电阻，确保合格', hazard_inspection_method: '仪器检测', hazard_inspection_cycle: '季度', hazard_inspection_position: '安全工作岗', control_responsibility_unit: '安全工作部', control_responsibility_position: '安全主管', remarks: '', created_at: new Date().toISOString(), updated_at: new Date().toISOString(), version: 1 },
+  { id: '3', serial_number: 'C001', business_module: '消防设施', specific_location: '各仓库', risk_point_description: '消防器材配置不足或过期', risk_point_location: '仓库区域', risk_level: 'large', risk_control_measures: '定期检查更换，确保数量充足', hazard_inspection_method: '现场检查', hazard_inspection_cycle: '月度', hazard_inspection_position: '仓管员', control_responsibility_unit: '安全工作部', control_responsibility_position: '安全主管', remarks: '', created_at: new Date().toISOString(), updated_at: new Date().toISOString(), version: 1 },
+  { id: '4', serial_number: 'D001', business_module: '用电安全', specific_location: '施工作业区', risk_point_description: '临时用电管理不规范', risk_point_location: '作业现场', risk_level: 'general', risk_control_measures: '严格执行临时用电审批制度', hazard_inspection_method: '现场检查', hazard_inspection_cycle: '月度', hazard_inspection_position: '安全工作岗', control_responsibility_unit: '安全工作部', control_responsibility_position: '安全主管', remarks: '', created_at: new Date().toISOString(), updated_at: new Date().toISOString(), version: 1 },
+  { id: '5', serial_number: 'E001', business_module: '特种设备', specific_location: '起重作业区', risk_point_description: '起重机械未定期检验', risk_point_location: '装卸区', risk_level: 'large', risk_control_measures: '按期送检，取得合格证后方可使用', hazard_inspection_method: '证件检查+现场确认', hazard_inspection_cycle: '年度', hazard_inspection_position: '安全工作岗', control_responsibility_unit: '物资仓储部', control_responsibility_position: '仓储班长', remarks: '', created_at: new Date().toISOString(), updated_at: new Date().toISOString(), version: 1 },
+];
+
+// ============ 公开 API ============
+
+export async function getUsers(): Promise<User[]> {
+  const local = await readLocal<User>(USERS_KEY);
+  if (local.length > 0) {
+    // 确保每条记录都有 id（兼容旧数据）
+    let needsUpdate = false;
+    for (let i = 0; i < local.length; i++) {
+      if (!local[i].id) {
+        local[i].id = `legacy_user_${i + 1}_${Date.now()}`;
+        needsUpdate = true;
+      }
+    }
+    if (needsUpdate) {
+      await saveUsers(local);
+    }
+    return local;
+  }
+  const cloudData = await readFromCloud(USERS_KEY, DEFAULT_USERS) as User[];
+  // 无云端配置时确保本地有默认数据
+  await writeLocal(USERS_KEY, cloudData);
+  return cloudData;
+}
+
+export async function saveUsers(users: User[]): Promise<boolean> {
+  return writeToCloud(USERS_KEY, users);
+}
+
+export async function getHazards(): Promise<Hazard[]> {
+  const local = await readLocal<Hazard>(HAZARDS_KEY);
+  if (local.length > 0) {
+    // 确保每条记录都有 id（兼容旧数据）
+    let needsUpdate = false;
+    for (let i = 0; i < local.length; i++) {
+      if (!local[i].id) {
+        local[i].id = `legacy_${i + 1}_${Date.now()}`;
+        needsUpdate = true;
+      }
+    }
+    if (needsUpdate) {
+      await saveHazards(local);
+    }
+    return local;
+  }
+  return readFromCloud(HAZARDS_KEY, []) as Promise<Hazard[]>;
+}
+
+export async function saveHazards(hazards: Hazard[]): Promise<boolean> {
+  return writeToCloud(HAZARDS_KEY, hazards);
+}
+
+export async function addHazard(hazard: Hazard): Promise<boolean> {
+  const hazards = await getHazards();
+  hazards.push(hazard);
+  return saveHazards(hazards);
+}
+
+export async function updateHazard(id: string, updates: Partial<Hazard>): Promise<boolean> {
+  const hazards = await getHazards();
+  const idx = hazards.findIndex((h) => h.id === id);
+  if (idx === -1) return false;
+  hazards[idx] = { ...hazards[idx], ...updates };
+  return saveHazards(hazards);
+}
+
+export async function deleteHazard(id: string): Promise<boolean> {
+  const hazards = await getHazards();
+  const filtered = hazards.filter((h) => h.id !== id);
+  if (filtered.length === hazards.length) return false;
+  return saveHazards(filtered);
+}
+
+export async function getRiskItems(): Promise<RiskItem[]> {
+  const local = await readLocal<RiskItem>(RISK_ITEMS_KEY);
+  if (local.length > 0) return local;
+  const cloudData = await readFromCloud(RISK_ITEMS_KEY, DEFAULT_RISK_ITEMS) as RiskItem[];
+  await writeLocal(RISK_ITEMS_KEY, cloudData);
+  return cloudData;
+}
+
+export async function saveRiskItems(items: RiskItem[]): Promise<boolean> {
+  return writeToCloud(RISK_ITEMS_KEY, items);
+}
+
+export async function addRiskItem(item: RiskItem): Promise<boolean> {
+  const items = await getRiskItems();
+  items.push(item);
+  return saveRiskItems(items);
+}
+
+export async function updateRiskItem(id: string, updates: Partial<RiskItem>): Promise<boolean> {
+  const items = await getRiskItems();
+  const idx = items.findIndex((i) => i.id === id);
+  if (idx === -1) return false;
+  items[idx] = { ...items[idx], ...updates };
+  return saveRiskItems(items);
+}
+
+export async function deleteRiskItem(id: string): Promise<boolean> {
+  const items = await getRiskItems();
+  const filtered = items.filter((i) => i.id !== id);
+  if (filtered.length === items.length) return false;
+  return saveRiskItems(filtered);
+}
+
+// 密码哈希函数统一在 crypto.ts 中定义，此处重导出以保持兼容
+export { hashPassword, verifyPassword } from './crypto';
+
+export async function getUserByUsername(username: string): Promise<User | null> {
+  const users = await getUsers();
+  return users.find((u) => u.username === username) || null;
+}
+
+export async function getUserById(id: string): Promise<User | null> {
+  const users = await getUsers();
+  return users.find((u) => u.id === id) || null;
+}
+
+export async function updateUser(id: string, updates: Partial<User>): Promise<boolean> {
+  const users = await getUsers();
+  const idx = users.findIndex((u) => u.id === id);
+  if (idx === -1) return false;
+  users[idx] = { ...users[idx], ...updates, updated_at: new Date().toISOString() };
+  return saveUsers(users);
+}
+
+export async function createUser(data: any): Promise<User | null> {
+  const users = await getUsers();
+  if (users.some((u) => u.username === data.username)) return null;
+  
+  const newUser: User = {
+    id: Date.now().toString(),
+    username: data.username,
+    password_hash: authHashPassword(data.password),
+    role: data.role || 'inspector',
+    name: data.name || '',
+    employee_id: data.employee_id || '',
+    inspection_center: data.inspection_center || '物资后勤中心',
+    inspection_department: data.inspection_department || '',
+    inspection_team: data.inspection_team || '',
+    inspection_position: data.inspection_position || '',
+    created_at: new Date().toISOString(),
+    updated_at: new Date().toISOString(),
+  };
+  
+  users.push(newUser);
+  const ok = await saveUsers(users);
+  return ok ? newUser : null;
+}
+
+export async function deleteUser(id: string): Promise<boolean> {
+  const users = await getUsers();
+  const filtered = users.filter((u) => u.id !== id);
+  if (filtered.length === users.length) return false;
+  return saveUsers(filtered);
+}
+
+export async function initializeData() {
+  await getUsers();
+  await getRiskItems();
+}
