@@ -318,7 +318,16 @@ export async function deleteUser(id: string): Promise<boolean> {
 export async function getHazards(): Promise<any[]> {
   const db = getDb();
   migrateIfNeeded();
-  return db.prepare('SELECT * FROM hazards ORDER BY created_at DESC').all() as any[];
+  const rows = db.prepare('SELECT * FROM hazards ORDER BY created_at DESC').all() as any[];
+  // ýýýý images ý¶£ýSQLite ý4ýª JSON ý·ýýýýý
+  return rows.map(row => {
+    if (row.images) {
+      try { row.images = JSON.parse(row.images); } catch { row.images = []; }
+    } else {
+      row.images = [];
+    }
+    return row;
+  });
 }
 
 export async function getHazardById(id: string): Promise<any | null> {
