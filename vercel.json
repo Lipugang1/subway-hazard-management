@@ -1,0 +1,7 @@
+{
+  "framework": "nextjs",
+  "buildCommand": "npx pnpm install --prefer-frozen-lockfile && npx pnpm next build",
+  "outputDirectory": ".",
+  "installCommand": "npx pnpm install --prefer-frozen-lockfile",
+  "nodeVersion": "20.x"
+}
